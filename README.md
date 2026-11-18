@@ -5,7 +5,8 @@ It lists the latest release of every major version from Lion (10.7) up to the ne
 
 - Python 3 standard library only, no dependencies
 - Works on macOS and Linux
-- Interrupted downloads resume, and completed files are skipped
+- Dropped or stalled connections reconnect automatically and continue where they stopped (up to 20 consecutive retries with growing delays, max 60 s)
+- Interrupted downloads resume on the next run, and completed files are skipped
 - New releases are picked up automatically from Apple's software update catalog
 
 ## Usage

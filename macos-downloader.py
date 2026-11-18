@@ -18,12 +18,15 @@ Only the Python 3 standard library is used, so it runs on macOS and Linux.
 
 import argparse
 import curses
+import errno
+import http.client
 import os
 import plistlib
 import re
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
@@ -54,6 +57,8 @@ LEGACY = [
 
 USER_AGENT = "Software%20Update (unknown version) CFNetwork/807.0.1 Darwin/16.0.0 (x86_64)"
 CHUNK = 1 << 20
+MAX_RETRIES = 20      # consecutive failed reconnects before giving up on a file
+RETRY_MAX_DELAY = 60  # seconds
 
 
 class Release:
@@ -180,6 +185,7 @@ class Downloader:
         self.file_done = self.file_size = 0
         self.rel_done = 0
         self.speed = 0.0
+        self.note = ""
         self.finished = False
         self.thread = threading.Thread(target=self.run, daemon=True)
 
@@ -217,7 +223,49 @@ class Downloader:
         if os.path.exists(dest) and (not size or os.path.getsize(dest) == size):
             self.file_done = size
             return
+        def on_disk():
+            return os.path.getsize(part) if os.path.exists(part) else 0
+
+        failures = 0
+        while not self.cancel.is_set():
+            before = on_disk()
+            try:
+                self.fetch_part(url, part, size)
+                break
+            except urllib.error.HTTPError as e:
+                if e.code < 500:
+                    raise
+                err = e
+            except (OSError, http.client.HTTPException) as e:
+                if getattr(e, "errno", None) == errno.ENOSPC:
+                    raise
+                err = e
+            # Only consecutive failures without progress count towards giving up.
+            failures = 1 if on_disk() > before else failures + 1
+            if failures > MAX_RETRIES:
+                raise err
+            delay = min(RETRY_MAX_DELAY, 2 ** failures)
+            for left in range(delay, 0, -1):
+                self.note = (f"connection lost ({err}); reconnecting in {left}s "
+                             f"[{failures}/{MAX_RETRIES}]")
+                if self.cancel.wait(1):
+                    break
+            self.speed = 0.0
+        self.note = ""
+        if self.cancel.is_set():
+            return
+        os.replace(part, dest)
+
+    def fetch_part(self, url, part, size):
+        """Download into the .part file, continuing from whatever it already holds."""
+        name = os.path.basename(part)[:-5]
         have = os.path.getsize(part) if os.path.exists(part) else 0
+        if size and have > size:
+            os.remove(part)
+            have = 0
+        self.file_done = have
+        if size and have == size:
+            return
         headers = {"User-Agent": USER_AGENT}
         if have:
             headers["Range"] = f"bytes={have}-"
@@ -232,7 +280,8 @@ class Downloader:
             window_start, window_bytes = time.monotonic(), 0
             with open(part, "ab" if have else "wb") as f:
                 while not self.cancel.is_set():
-                    chunk = resp.read(CHUNK)
+                    # read1 returns what has arrived, so little is lost if the link drops.
+                    chunk = resp.read1(CHUNK)
                     if not chunk:
                         break
                     f.write(chunk)
@@ -242,11 +291,8 @@ class Downloader:
                     if elapsed >= 1:
                         self.speed = window_bytes / elapsed
                         window_start, window_bytes = time.monotonic(), 0
-        if self.cancel.is_set():
-            return
-        if size and os.path.getsize(part) != size:
-            raise IOError(f"{name}: size mismatch")
-        os.replace(part, dest)
+        if not self.cancel.is_set() and size and os.path.getsize(part) < size:
+            raise ConnectionError(f"{name}: connection closed early")
 
 
 # ---------------------------------------------------------------- TUI
@@ -338,6 +384,8 @@ def progress_screen(scr, chosen, outdir):
             put(scr, y + 1, 2, f"{bar(done / total, width)} {done * 100 // total:3d}%")
             put(scr, y + 2, 2, f"{dl.file_name}: {human(fdone)} / {human(fsize)}"
                                f"   {human(dl.speed)}/s   ETA {int(eta // 60)}m{int(eta % 60):02d}s")
+            if dl.note:
+                put(scr, y + 3, 2, dl.note, curses.A_BOLD)
         if dl.finished:
             put(scr, h - 2, 2, "Finished. Press any key to exit.", curses.A_BOLD)
         elif confirm_quit:
@@ -379,7 +427,8 @@ def plain_download(releases, outdir):
             if dl.current:
                 done = dl.rel_done + dl.file_done
                 pct = done * 100 // (dl.current.size or 1)
-                print(f"\r{dl.current.label}: {pct:3d}%  {human(dl.speed)}/s   ",
+                extra = f"  {dl.note}" if dl.note else ""
+                print(f"\r\033[K{dl.current.label}: {pct:3d}%  {human(dl.speed)}/s{extra}",
                       end="", flush=True)
     except KeyboardInterrupt:
         dl.cancel.set()

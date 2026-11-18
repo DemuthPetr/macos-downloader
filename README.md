@@ -48,3 +48,7 @@ Mavericks (10.9) and Snow Leopard (10.6) are not offered by Apple as direct down
 - Installers are large: downloading everything takes about 150 GB.
 - The legacy DMG installer packages refuse to run on Macs with a newer macOS. On Linux you can unpack them with `7z` or `xar`.
 - All downloads come straight from Apple's servers; nothing is mirrored or modified.
+
+## License
+
+[MIT](LICENSE). This covers the script only; the macOS installers it downloads are Apple's software and remain under Apple's terms.
